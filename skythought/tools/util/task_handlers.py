@@ -106,6 +106,23 @@ class MATH500TaskHandler(MathTaskHandler):
     def get_question_key():
         return "problem"
 
+
+class MinervaMathTaskHandler(MathTaskHandler):
+    def __init__(self):
+        self.dataset = "svc-huggingface/minerva-math"
+    
+    @staticmethod
+    def get_question_key():
+        return "problem"
+
+    def check_correctness(self, problem, generation):
+        answer = extract_answer(problem["solution"])
+        answer = strip_answer_string(answer)
+
+        pred = extract_answer(generation)
+        pred = strip_answer_string(pred)
+        return math_equal(pred, answer)
+
 class AIMETaskHandler(MathTaskHandler):
     def __init__(self):
         self.dataset = "AI-MO/aimo-validation-aime"
@@ -847,6 +864,7 @@ TASK_HANDLERS = {
     "APPS": APPSTaskHandler,
     "TACO": TACOTaskHandler,
     "MATH500": MATH500TaskHandler,
+    "MinervaMath": MinervaMathTaskHandler,
     "AIME": AIMETaskHandler,
     "GPQADiamond": GPQADiamondTaskHandler,
     "MMLU": MMLUTaskHandler,
