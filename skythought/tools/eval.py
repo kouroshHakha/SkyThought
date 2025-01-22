@@ -6,6 +6,7 @@ import json
 # Define eval to split mapping
 eval_to_split = {
   "MATH500": "test", 
+  "MinvervaMath": "test", 
   "AIME": "train", 
   "GPQADiamond": "train", 
   "MMLU": "test",
