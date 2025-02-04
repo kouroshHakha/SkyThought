@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional, Union
 from dataclasses import dataclass
+from abc import ABC, abstractmethod
 import ray.data
 import os
 from ray.data.llm import (
@@ -54,7 +55,7 @@ class VLLMBackendConfig:
             batch_size=self.batch_size,
         )
 
-class Env:
+class Env(ABC):
     """Base class for evaluation environments"""
     
     def __init__(self, **kwargs):
@@ -99,25 +100,61 @@ class Env:
         """Default postprocessor that extracts generated text"""
         return {"generated_text": item["generated_text"]}
         
+    @abstractmethod
     def read_dataset(self) -> ray.data.Dataset:
         """Read the default dataset for this environment"""
-        raise NotImplementedError
+        pass
         
-    def generate(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
-        """Run generation on the dataset"""
-        raise NotImplementedError
-        
-    def score(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
-        """Score the generations in the dataset"""
-        raise NotImplementedError
-        
+    @abstractmethod
     def score_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Score a single item"""
-        raise NotImplementedError
+        pass
+
+    def score(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
+        """Score the generations in the dataset"""
+        return dataset.map(self.score_item)
         
     def apply_prompt_template_on_item(self, item: Dict[str, Any]) -> str:
         """Apply the prompt template to a single item"""
-        raise NotImplementedError
+        if isinstance(self.template, str):
+            return self.template.format(**item)
+        elif isinstance(self.template, list):
+            return [
+                {"role": msg["role"], "content": msg["content"].format(**item)}
+                for msg in self.template
+            ]
+        else:
+            raise ValueError(f"Unsupported template type: {type(self.template)}")
         
     def save(self, dataset: ray.data.Dataset, path: str, format: str = "json"):
-        raise NotImplementedError
+        """Save the dataset results
+        
+        Args:
+            dataset: Dataset to save
+            path: Directory to save results
+            format: Format to save in (json, parquet, etc)
+        """
+        os.makedirs(path, exist_ok=True)
+        
+        # Save generations
+        os.makedirs(os.path.join(path, "generations"), exist_ok=True)
+        dataset.write_json(os.path.join(path, "generations"))
+        
+        # Save scores if they exist
+        if "score" in dataset.columns():
+            os.makedirs(os.path.join(path, "scores"), exist_ok=True)
+            dataset.select_columns(["score"]).write_json(
+                os.path.join(path, "scores")
+            )
+            
+        # Save failures if they exist
+        failures = dataset.filter(lambda x: "error" in x)
+        if not failures.is_empty():
+            os.makedirs(os.path.join(path, "failures"), exist_ok=True)
+            failures.write_json(os.path.join(path, "failures"))
+
+    def generate(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
+        """Run generation on the dataset"""
+        if self._processor is None:
+            raise RuntimeError("Environment not set up. Call setup() first.")
+        return self._processor(dataset)
