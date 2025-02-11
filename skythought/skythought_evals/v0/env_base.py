@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import ray.data
@@ -8,6 +8,10 @@ from ray.data.llm import (
     VLLMProcessorConfig,
     HTTPRequestProcessorConfig,
 )
+
+if TYPE_CHECKING:
+    from ray.llm._internal.batch.processor import Processor
+
 
 @dataclass
 class HTTPBackendConfig:
@@ -63,7 +67,9 @@ class Env(ABC):
         self.template = None
         self.sampling_params = None
         self._dataset = None
-        self._processor = None
+        self._llm_processor = None
+        self._score_processors = None 
+        
         
     def setup(self, 
               backend_config: Union[VLLMBackendConfig, HTTPBackendConfig],
@@ -74,13 +80,16 @@ class Env(ABC):
         self.template = template
         self.sampling_params = sampling_params or {}
         
-        # Build the processor
+        # Build the llm processor
         processor_config = self.backend_config.get_ray_llm_batch_config()
-        self._processor = build_llm_processor(
+        self._llm_processor = build_llm_processor(
             processor_config,
             preprocess=self._preprocess_item,
             postprocess=self._postprocess_item,
         )
+        
+        # Build the score processors
+        self._score_processors = self._build_score_processors()
     
     def _preprocess_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Default preprocessor that applies the template"""
@@ -112,7 +121,15 @@ class Env(ABC):
 
     def score(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
         """Score the generations in the dataset"""
-        return dataset.map(self.score_item)
+        # iteratively apply the score processors
+        
+        if self._score_processors is None:
+            raise RuntimeError("Score generators not set up. Call setup() first.")
+        
+        ds = dataset
+        for score_generator in self._score_processors:
+            ds = score_generator(ds)
+        return ds
         
     def apply_prompt_template_on_item(self, item: Dict[str, Any]) -> str:
         """Apply the prompt template to a single item"""
@@ -155,6 +172,12 @@ class Env(ABC):
 
     def generate(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
         """Run generation on the dataset"""
-        if self._processor is None:
+        if self._llm_processor is None:
             raise RuntimeError("Environment not set up. Call setup() first.")
-        return self._processor(dataset)
+        return self._llm_processor(dataset)
+    
+    
+    def _build_score_processors(self) -> List["Processor"]:
+        return []
+    
+    
