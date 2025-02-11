@@ -1,26 +1,32 @@
 import argparse
 import concurrent.futures
+import copy
 import json
+import math
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 
 import numpy as np
+import ray
+from batch import Pipeline, init_engine_from_config
+from batch.env_config import EnvConfig
+from batch.workload import EvalWorkload, load_config_from_path
 from openai import OpenAI
+from skythought_evals.models import ModelConfig, get_system_prompt_keys
 from skythought_evals.tasks import (
     TASK_HANDLER_MAP,
+    TASK_NAMES_TO_YAML,
     NUMINATaskHandler,
     TaskConfig,
     TaskHandler,
 )
-from skythought_evals.tasks.task_util import get_tasks
 from skythought_evals.util.common import set_seed
-from skythought_evals.util.model_utils import MODEL_TO_NAME, SYSTEM_PROMPT
+from skythought_evals.util.response import Response
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
 module_dir = os.path.dirname(os.path.abspath(__file__))
-TASK_NAMES_TO_YAML = get_tasks(os.path.join(module_dir, "tasks"))
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -56,15 +62,69 @@ def fetch_response_openai(llm, model_name, max_tokens, temp, prompt):
     return response
 
 
+def fetch_responses_ray(conversations, max_tokens, temp, args):
+    config = load_config_from_path(args.ray_config)
+    config["model_id"] = args.model
+    engine_cfg = init_engine_from_config(config)
+    ds = ray.data.from_items([(idx, conv) for idx, conv in enumerate(conversations)])
+    num_replicas = config["env_config"].get("num_replicas", 1)
+    if ds.count() < config["env_config"].get("batch_size", 1):
+        config["env_config"]["batch_size"] = math.ceil(ds.count() / num_replicas)
+    if num_replicas > 1 and num_replicas > ds.num_blocks():
+        ds = ds.repartition(num_partitions=num_replicas)
+    workload = EvalWorkload(
+        dataset=ds,
+        sampling_params={"n": args.n, "max_tokens": max_tokens, "temperature": temp},
+    )
+    pipeline = Pipeline(
+        engine_cfg,
+        env_config=EnvConfig(**config["env_config"]),
+    )
+    ds = pipeline(workload)
+    responses = ds.materialize()
+    return responses
+
+
+def inference(llm, conversations, max_tokens, temp, args):
+    if args.use_ray:
+        responses = fetch_responses_ray(conversations, max_tokens, temp, args)
+        responses = [
+            Response.from_ray_response(response) for response in responses.iter_rows()
+        ]
+        # TODO/NOTE: This deepcopy is needed to avoid a SIGSEV error related to object cleanup with the ray object store and
+        # the later use of ProcessPoolExecutor - see here: https://github.com/NovaSky-AI/SkyThought/pull/63#discussion_r1941899714
+        # revisit the underlying issue and remove the deepcopy if possible
+        responses = copy.deepcopy(responses)
+        responses = sorted(responses, key=lambda x: x.index)
+    elif args.model.startswith("openai"):
+        fetch_partial = partial(
+            fetch_response_openai, llm, args.model, max_tokens, temp
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as e:
+            responses = list(e.map(fetch_partial, conversations))
+
+        responses = [Response.from_openai_response(response) for response in responses]
+    else:
+        sampling_params = SamplingParams(max_tokens=max_tokens, temperature=temp)
+        responses = llm.chat(
+            messages=conversations, sampling_params=sampling_params, use_tqdm=True
+        )
+        responses = [Response.from_vllm_response(response) for response in responses]
+
+    return responses
+
+
 def perform_inference_and_check(
     handler: TaskHandler,
     temperatures,
     max_tokens,
     result_file,
     llm,
-    system_prompt,
+    model_config,
     args,
 ):
+    assert args.n == 1, "Check does not support multiple samples"
     results = handler.load_existing_results(result_file)
     print(f"Loaded {len(results)} existing results.")
     train_data = handler.load_and_filter_dataset(
@@ -77,51 +137,31 @@ def perform_inference_and_check(
     )
     remaining_data = handler.process_remaining_data(train_data, results)
     conversations = handler.make_conversations(
-        remaining_data, system_prompt, args.model
+        remaining_data, model_config.system_prompt, model_config.user_template
     )
     for temp in temperatures:
-        if args.model.startswith("openai"):
-            fetch_partial = partial(
-                fetch_response_openai, llm, args.model, max_tokens, temp
-            )
+        if len(conversations) == 0:
+            print("No more data to process")
+            continue
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as e:
-                responses = list(e.map(fetch_partial, conversations))
-
-        else:
-            sampling_params = SamplingParams(max_tokens=max_tokens, temperature=temp)
-            responses = llm.chat(
-                messages=conversations, sampling_params=sampling_params, use_tqdm=True
-            )
+        responses = inference(llm, conversations, max_tokens, temp, args)
 
         total_correct = 0
         total_finish = 0
         with ProcessPoolExecutor(max_workers=32) as executor:
-            # future_to_task = {
-            #     executor.submit(handler.update_results, remaining_data[idx], response): idx
-            #     for idx, response in enumerate(responses)
-            # }
             future_to_task = {}
             token_usages = {}
             for idx, response in enumerate(responses):
-                if args.model.startswith("openai"):
-                    response_str = response.choices[0].message.content.strip()
-                else:
-                    response_str = response.outputs[0].text.strip()
+                response_str = response.response.strip()
                 future_to_task[
                     executor.submit(
                         handler.update_results, remaining_data[idx], response_str
                     )
                 ] = idx
-                # print(f"Request output: {response}")
-
-                if args.model.startswith("openai"):
-                    token_usages[idx] = response.usage
-                else:
-                    token_usages[idx] = {
-                        "completion_tokens": len(response.outputs[0].token_ids),
-                        "prompt_tokens": len(response.prompt_token_ids),
-                    }
+                token_usages[idx] = {
+                    "completion_tokens": response.num_completion_tokens,
+                    "prompt_tokens": response.num_input_tokens,
+                }
 
             for future in tqdm(
                 as_completed(future_to_task),
@@ -146,14 +186,7 @@ def perform_inference_and_check(
 
                 results[problem_key]["responses"][str(temp)] = response_entry
 
-                if args.model.startswith("openai"):
-                    results[problem_key]["token_usages"][str(temp)] = {
-                        "completion_tokens": token_usages[idx].completion_tokens,
-                        "prompt_tokens": token_usages[idx].prompt_tokens,
-                    }
-                else:
-                    # TODO: vLLM model, can it do the same thing
-                    results[problem_key]["token_usages"][str(temp)] = token_usages[idx]
+                results[problem_key]["token_usages"][str(temp)] = token_usages[idx]
 
         print(f"Final acc: {total_correct}/{total_finish}")
         acc = round(total_correct / total_finish, 4) if total_finish > 0 else 0
@@ -305,7 +338,7 @@ def perform_inference_and_save(
     max_tokens,
     result_file,
     llm,
-    system_prompt,
+    model_config,
     args,
 ):
     results = handler.load_existing_results(result_file)
@@ -320,25 +353,14 @@ def perform_inference_and_save(
     )
     remaining_data = handler.process_remaining_data(train_data, results)
     conversations = handler.make_conversations(
-        remaining_data, system_prompt, args.model
+        remaining_data, model_config.system_prompt, model_config.user_template
     )
 
     for temp in temperatures:
-        if args.model.startswith("openai"):
-            fetch_partial = partial(
-                fetch_response_openai, llm, args.model, max_tokens, temp
-            )
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as e:
-                responses = list(e.map(fetch_partial, conversations))
-
-        else:
-            sampling_params = SamplingParams(
-                n=args.n, max_tokens=max_tokens, temperature=temp
-            )
-            responses = llm.chat(
-                messages=conversations, sampling_params=sampling_params, use_tqdm=True
-            )
+        if len(conversations) == 0:
+            print("No more data to process")
+            continue
+        responses = inference(llm, conversations, max_tokens, temp, args)
 
         completion_tokens = []
         prompt_tokens = []
@@ -347,28 +369,36 @@ def perform_inference_and_save(
             token_usages = []
             completion_token = 0
             for sample_idx in range(args.n):
+                if args.model.startswith("openai"):
+                    content = response.response.strip()
+                else:
+                    content = response.response[sample_idx].strip()
                 response_entry = {
-                    "content": (
-                        response.choices[0].message.content.strip()
-                        if args.model.startswith("openai")
-                        else response.outputs[sample_idx].text.strip()
-                    ),
+                    "content": content,
                     "correctness": None,
                     "reason": None,
                 }
                 response_entries.append(response_entry)
-                if not args.model.startswith("openai"):
+                if args.model.startswith("openai"):
                     token_usages.append(
                         {
-                            "completion_tokens": len(
-                                response.outputs[sample_idx].token_ids
-                            ),
-                            "prompt_tokens": len(response.prompt_token_ids),
+                            "completion_tokens": response.num_completion_tokens,
+                            "prompt_tokens": response.num_input_tokens,
                         }
                     )
-                    completion_token += len(response.outputs[sample_idx].token_ids)
+                else:
+                    token_usages.append(
+                        {
+                            "completion_tokens": response.num_completion_tokens[
+                                sample_idx
+                            ],
+                            "prompt_tokens": response.num_input_tokens,
+                        }
+                    )
+                    completion_token += response.num_completion_tokens[sample_idx]
+
             completion_token /= args.n
-            prompt_token = len(response.prompt_token_ids)
+            prompt_token = response.num_input_tokens
             prompt_tokens.append(prompt_token)
             completion_tokens.append(completion_token)
 
@@ -386,13 +416,7 @@ def perform_inference_and_save(
 
             results[problem_key]["responses"][str(temp)] = response_entries
 
-            if args.model.startswith("openai"):
-                results[problem_key]["token_usages"][str(temp)] = {
-                    "completion_tokens": response.usage.completion_tokens,
-                    "prompt_tokens": response.usage.prompt_tokens,
-                }
-            else:
-                results[problem_key]["token_usages"][str(temp)] = token_usages
+            results[problem_key]["token_usages"][str(temp)] = token_usages
 
     # Token usage summary put into another subdirectory
     result_dir, result_name = os.path.split(result_file)
@@ -502,12 +526,32 @@ def main():
         help="Highest difficulty level for math.",
     )
     parser.add_argument(
+        "--system-prompt-template",
+        type=str,
+        default=None,
+        help="System prompt template to use",
+        choices=get_system_prompt_keys(),
+    )
+    parser.add_argument(
         "--n", type=int, default=1, help="Number of samples generated per problem."
     )
     parser.add_argument("--seed", type=int, default=41, help="Random seed.")
+    parser.add_argument(
+        "--use_ray", action="store_true", help="Use ray for scaling inference."
+    )
+    parser.add_argument(
+        "--ray_config",
+        type=str,
+        default="ray_configs/ray_config.yaml",
+        help="Ray configuration file if using ray for scaling inference.",
+    )
 
     args = parser.parse_args()
     set_seed(args.seed)
+
+    # use os to enable hf_transfer for model download
+    if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", None) not in ["1", "True"]:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
     if args.task not in TASK_NAMES_TO_YAML:
         raise ValueError(
@@ -518,6 +562,8 @@ def main():
     handler_name = task_config.handler
     handler_cls = TASK_HANDLER_MAP[handler_name]
     handler = handler_cls(task_config)
+
+    model_config = ModelConfig.from_model_id(args.model, args.system_prompt_template)
 
     temperatures = [1] if args.model.startswith("openai/o1") else args.temperatures
 
@@ -543,12 +589,12 @@ def main():
     ):
         result_file = os.path.join(
             args.result_dir,
-            f"{MODEL_TO_NAME[args.model]}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}_{args.start}_{args.end}_{args.math_difficulty_lower_bound}_{args.math_difficulty_upper_bound}.json",
+            f"{model_config.name}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}_{args.start}_{args.end}_{args.math_difficulty_lower_bound}_{args.math_difficulty_upper_bound}.json",
         )
     else:
         result_file = os.path.join(
             args.result_dir,
-            f"{MODEL_TO_NAME[args.model]}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}_{args.start}_{args.end}.json",
+            f"{model_config.name}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}_{args.start}_{args.end}.json",
         )
 
     if args.check:
@@ -558,44 +604,33 @@ def main():
             or args.math_difficulty_upper_bound is not None
         ):
             converted_file = (
-                f"{args.result_dir}/converted_{MODEL_TO_NAME[args.model]}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}_{args.start}_{args.end}"
+                f"{args.result_dir}/converted_{model_config.name}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}_{args.start}_{args.end}"
                 + f"_{args.math_difficulty_lower_bound}_{args.math_difficulty_upper_bound}.json"
             )
         else:
-            converted_file = f"{args.result_dir}/converted_{MODEL_TO_NAME[args.model]}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}"
+            converted_file = f"{args.result_dir}/converted_{model_config.name}_{args.task}_{args.split}_{args.subset}_{args.filter_difficulty}"
             f"_{args.start}_{args.end}.json"
         if os.path.exists(converted_file):
             result_file = converted_file
         perform_check(handler, temperatures, result_file, args)
         return
-    elif args.inference:
-        llm = (
-            OpenAI()
-            if args.model.startswith("openai")
-            else LLM(model=args.model, tensor_parallel_size=args.tp)
-        )
-        system_prompt = SYSTEM_PROMPT[args.model]
-        perform_inference_and_save(
-            handler, temperatures, max_tokens, result_file, llm, system_prompt, args
-        )
-        return
-
-    llm = (
-        OpenAI()
-        if args.model.startswith("openai")
-        else LLM(model=args.model, tensor_parallel_size=args.tp)
-    )
-    system_prompt = SYSTEM_PROMPT[args.model]
-
-    perform_inference_and_check(
-        handler,
-        temperatures,
-        max_tokens,
-        result_file,
-        llm,
-        system_prompt,
-        args,
-    )
+    else:
+        if args.use_ray:
+            llm = None
+        else:
+            llm = (
+                OpenAI()
+                if args.model.startswith("openai")
+                else LLM(model=args.model, tensor_parallel_size=args.tp)
+            )
+        if args.inference:
+            perform_inference_and_save(
+                handler, temperatures, max_tokens, result_file, llm, model_config, args
+            )
+        else:
+            perform_inference_and_check(
+                handler, temperatures, max_tokens, result_file, llm, model_config, args
+            )
 
 
 if __name__ == "__main__":

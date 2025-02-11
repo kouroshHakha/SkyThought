@@ -1,5 +1,5 @@
 import copy
-from typing import Dict
+from typing import Any, Dict, List, Optional
 
 from datasets import Dataset as HFDataset
 from skythought_evals.util.common import has_code
@@ -85,15 +85,21 @@ class LiveCodeBenchTaskHandler(TaskHandler):
 
         return response_entry
 
-    def make_conversations(self, data, system_prompt, model=None):
+    def make_conversations(
+        self,
+        data: List[Dict[str, Any]],
+        system_prompt: Optional[str] = None,
+        user_template: Optional[str] = None,
+    ):
         conversations = []
         for problem in data:
             prompt_text = self.generate_prompt(problem)
             conversations.append(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt_text},
-                ]
+                self.make_conversation_from_contents(
+                    [prompt_text],
+                    system_prompt=system_prompt,
+                    user_template=user_template,
+                )
             )
         return conversations
 

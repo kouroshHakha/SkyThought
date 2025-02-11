@@ -165,7 +165,7 @@ cython_debug/
 # Vim
 *.swp
 
-.json
+*.json
 token_usage/
 
 run_all.sh
