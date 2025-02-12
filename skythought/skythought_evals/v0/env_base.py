@@ -8,7 +8,6 @@ from ray.data.llm import (
     VLLMProcessorConfig,
     HTTPRequestProcessorConfig,
 )
-import asyncio
 
 if TYPE_CHECKING:
     from ray.llm._internal.batch.processor import Processor
@@ -72,25 +71,10 @@ class Env(ABC):
         
         # Build the score processors
         self._score_processors = self._build_score_processors()
-        
-        
-    def setup(self, 
-              backend_config: Union[VLLMBackendConfig, HTTPBackendConfig],
-              template: Optional[Union[str, Dict, list]] = None,
-              sampling_params: Optional[Dict[str, Any]] = None) -> None:
-        """Configure the environment with backend and generation parameters"""
-        self.backend_config = backend_config
-        self.template = template or self.template
-        self.sampling_params = sampling_params or {}
-        
-        # Build the llm processor
-        processor_config = self.backend_config.get_ray_llm_batch_config()
-        self._llm_processor = build_llm_processor(
-            processor_config,
-            preprocess=self._preprocess_item,
-            postprocess=self._postprocess_item,
-        )
-        
+    
+    @OverrideToImplementCustomization    
+    def _build_score_processors(self) -> List["Processor"]:
+        return []
     
     def _preprocess_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Default preprocessor that applies the template"""
@@ -109,44 +93,31 @@ class Env(ABC):
     def _postprocess_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Default postprocessor that extracts generated text"""
         return {"generated_text": item["generated_text"]}
+
         
+    @PublicAPI
     @abstractmethod
     def read_dataset(self) -> ray.data.Dataset:
         """Read the default dataset for this environment"""
         pass
     
-    # TODO (Kourosh): Think whether this adds any value 
-    def score_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        """Score a single item"""
+    @PublicAPI
+    def setup(self, 
+              backend_config: Union[VLLMBackendConfig, HTTPBackendConfig],
+              template: Optional[Union[str, Dict, list]] = None,
+              sampling_params: Optional[Dict[str, Any]] = None) -> None:
+        """Configure the environment with backend and generation parameters"""
+        self.backend_config = backend_config
+        self.template = template or self.template
+        self.sampling_params = sampling_params or {}
         
-        stage_udfs = []
-        for score_processor in self._score_processors:
-            if score_processor.preprocess is not None:
-                stage_udfs.append(("preprocess", score_processor.preprocess))
-            for stage in score_processor.stages.values():
-                stage_udfs.append(("stage", stage.fn(**stage.fn_constructor_kwargs)))
-            if score_processor.postprocess is not None:
-                stage_udfs.append(("postprocess", score_processor.postprocess))
-                
-        ret_item = item
-        for stage_type, stage_udf in stage_udfs:
-            if stage_type == "stage":
-                ret_item = [ret_item]
-                
-            ret_item = asyncio.run(stage_udf(ret_item))
-            
-            if stage_type == "stage":
-                ret_item = ret_item[0]
-
-        return ret_item
-    
-    def score(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
-        """Score the generations in the dataset"""
-        # iteratively apply the score processors        
-        ds = dataset
-        for score_processor in self._score_processors:
-            ds = score_processor(ds)
-        return ds
+        # Build the llm processor
+        processor_config = self.backend_config.get_ray_llm_batch_config()
+        self._llm_processor = build_llm_processor(
+            processor_config,
+            preprocess=self._preprocess_item,
+            postprocess=self._postprocess_item,
+        )
         
     def apply_prompt_template_on_item(self, item: Dict[str, Any]) -> str:
         """Apply the prompt template to a single item"""
@@ -160,6 +131,24 @@ class Env(ABC):
         else:
             raise ValueError(f"Unsupported template type: {type(self.template)}")
         
+    @PublicAPI
+    def generate(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
+        """Run generation on the dataset"""
+        if self._llm_processor is None:
+            raise RuntimeError("Environment not set up. Call setup() first.")
+        return self._llm_processor(dataset)
+    
+    
+    @PublicAPI
+    def score(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
+        """Score the generations in the dataset"""
+        # iteratively apply the score processors        
+        ds = dataset
+        for score_processor in self._score_processors:
+            ds = score_processor(ds)
+        return ds
+    
+    @PublicAPI
     def save(self, dataset: ray.data.Dataset, path: str, format: str = "json"):
         """Save the dataset results
         
@@ -187,14 +176,3 @@ class Env(ABC):
             os.makedirs(os.path.join(path, "failures"), exist_ok=True)
             failures.write_json(os.path.join(path, "failures"))
 
-    def generate(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
-        """Run generation on the dataset"""
-        if self._llm_processor is None:
-            raise RuntimeError("Environment not set up. Call setup() first.")
-        return self._llm_processor(dataset)
-    
-    
-    def _build_score_processors(self) -> List["Processor"]:
-        return []
-    
-    
