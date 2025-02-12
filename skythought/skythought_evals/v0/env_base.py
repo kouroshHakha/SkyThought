@@ -77,7 +77,7 @@ class Env(ABC):
               sampling_params: Optional[Dict[str, Any]] = None) -> None:
         """Configure the environment with backend and generation parameters"""
         self.backend_config = backend_config
-        self.template = template
+        self.template = template or self.template
         self.sampling_params = sampling_params or {}
         
         # Build the llm processor
@@ -114,10 +114,6 @@ class Env(ABC):
         """Read the default dataset for this environment"""
         pass
         
-    @abstractmethod
-    def score_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        """Score a single item"""
-        pass
 
     def score(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
         """Score the generations in the dataset"""
@@ -127,8 +123,8 @@ class Env(ABC):
             raise RuntimeError("Score generators not set up. Call setup() first.")
         
         ds = dataset
-        for score_generator in self._score_processors:
-            ds = score_generator(ds)
+        for score_processor in self._score_processors:
+            ds = score_processor(ds)
         return ds
         
     def apply_prompt_template_on_item(self, item: Dict[str, Any]) -> str:

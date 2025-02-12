@@ -9,6 +9,20 @@ import ray
 
 class AIME24Env(Env):
     
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+        self.template = [
+            {
+                "role": "system",
+                "content": "Return your final response within \\boxed{{}}."
+            },
+            {
+                "role": "user",
+                "content": "{question}"
+            }
+        ]
+        
     def read_dataset(self) -> ray.data.Dataset:
         
         hf_ds = load_dataset(
@@ -18,8 +32,12 @@ class AIME24Env(Env):
             **self.task_config.dataset_kwargs
         )
         
+        ray_ds = ray.data.from_huggingface(hf_ds)
         
+        # filter out problems that don't contain "2024"
+        ray_ds = ray_ds.filter(lambda x: "2024" in x["url"])
         
+        return ray_ds
         
     
     def _build_score_processors(self) -> List[Processor]:
