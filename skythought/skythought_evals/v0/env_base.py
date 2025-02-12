@@ -8,6 +8,7 @@ from ray.data.llm import (
     VLLMProcessorConfig,
     HTTPRequestProcessorConfig,
 )
+import asyncio
 
 if TYPE_CHECKING:
     from ray.llm._internal.batch.processor import Processor
@@ -68,7 +69,9 @@ class Env(ABC):
         self.sampling_params = None
         self._dataset = None
         self._llm_processor = None
-        self._score_processors = None 
+        
+        # Build the score processors
+        self._score_processors = self._build_score_processors()
         
         
     def setup(self, 
@@ -88,8 +91,6 @@ class Env(ABC):
             postprocess=self._postprocess_item,
         )
         
-        # Build the score processors
-        self._score_processors = self._build_score_processors()
     
     def _preprocess_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Default preprocessor that applies the template"""
@@ -113,15 +114,35 @@ class Env(ABC):
     def read_dataset(self) -> ray.data.Dataset:
         """Read the default dataset for this environment"""
         pass
+    
+    # TODO (Kourosh): Think whether this adds any value 
+    def score_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Score a single item"""
         
+        stage_udfs = []
+        for score_processor in self._score_processors:
+            if score_processor.preprocess is not None:
+                stage_udfs.append(("preprocess", score_processor.preprocess))
+            for stage in score_processor.stages.values():
+                stage_udfs.append(("stage", stage.fn(**stage.fn_constructor_kwargs)))
+            if score_processor.postprocess is not None:
+                stage_udfs.append(("postprocess", score_processor.postprocess))
+                
+        ret_item = item
+        for stage_type, stage_udf in stage_udfs:
+            if stage_type == "stage":
+                ret_item = [ret_item]
+                
+            ret_item = asyncio.run(stage_udf(ret_item))
+            
+            if stage_type == "stage":
+                ret_item = ret_item[0]
 
+        return ret_item
+    
     def score(self, dataset: ray.data.Dataset) -> ray.data.Dataset:
         """Score the generations in the dataset"""
-        # iteratively apply the score processors
-        
-        if self._score_processors is None:
-            raise RuntimeError("Score generators not set up. Call setup() first.")
-        
+        # iteratively apply the score processors        
         ds = dataset
         for score_processor in self._score_processors:
             ds = score_processor(ds)
