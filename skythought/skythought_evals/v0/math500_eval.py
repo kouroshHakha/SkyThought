@@ -13,12 +13,14 @@ from skythought_evals.util.math_parsing_util import (
     strip_answer_string,
 )
 
-
+##### READ DATASET #####
 def read_dataset():
     hf_ds = load_dataset("qq8933/MATH500", split="test")
     ray_ds = ray.data.from_huggingface(hf_ds)
     return ray_ds
 
+
+##### LLM PROCESSOR #####
 template = [
     {
         "role": "user",
@@ -50,17 +52,20 @@ llm_processor = build_llm_processor(
     postprocess=lambda row: {**row, "generated_text": row["http_response"]["choices"][0]["message"]["content"]},
 )
 
+##### Testing READ DATASET and LLM PROCESSOR #####
 ds = read_dataset()
 ds = ds.limit(1)
 
 ds = llm_processor(ds)
 # row = out_ds.take(1)[0]
 
-# import pprint
-# pprint.pprint(row)
 
+##### Example of checking correctness #####
+# This can be used as simple map udf
+# But what is the problem with this? 
+# 1. It's not reusable in contexts where `answer` and `generated_text` are not the desired columns in the dataset
+# 2. It does not carry over the input. So after this stage is applied you lose input <> output relationship
 
-# Does not work
 # def check_correctness(row):
 #     answer = strip_answer_string(row["answer"])
 #     pred = extract_answer(row["generated_text"])
@@ -68,6 +73,13 @@ ds = llm_processor(ds)
 #     return {"correctness": math_equal(pred, answer)}
 # ds = ds.map(check_correctness)
 
+##### Making the reusable stages #####
+############## Strategy: 
+############## 1. One stage does extraction. configurable on which column to extract and strip or not for reusablity
+############## 2. One stage does equality check. configurable on which columns to check
+############## 3. For MATH500, we need to extract final boxed answer from both `generated_text` and `solution` and then do a math_equal check
+############## 4. This will be a processor with 3 stages. To instances of the first stage with different config and one instance of the third stage
+############## 5. To make a reusable processor, we can make more configurations on whether to extract answer from solution or not, etc.
 
 # Let's make the stateful stage udfs and in the end processors
 from ray.llm._internal.batch.stages.base import StatefulStageUDF, StatefulStage
@@ -101,7 +113,8 @@ class MathAnswerExtractorStage(StatefulStage):
     fn_constructor_kwargs: Dict[str, Any] = {}
     map_batches_kwargs: Dict[str, Any] = {"concurrency": 1}
 
-# Testing the extractor stage
+##### Testing the extractor stage #####
+
 stage1 = MathAnswerExtractorStage(
     fn_constructor_kwargs=dict(
         col_to_extract="generated_text",
@@ -109,9 +122,8 @@ stage1 = MathAnswerExtractorStage(
     ),
 )
 
-
+###### Side note: Testing an individual stage #####
 # NOTE: Standalone test of stage is not possible. So what is the quickest way to test an individual stage? 
-
 # Did not work!!
 # ds = ds.map_batches(
 #     MathAnswerExtractor,
@@ -132,9 +144,7 @@ stage1 = MathAnswerExtractorStage(
 # )
 # ds = processor(ds)
 
-
-# # Create a second stage and apply extractor to solution
-
+##### Creating the second stage #####
 stage2 = MathAnswerExtractorStage(
     fn_constructor_kwargs=dict(
         col_to_extract="solution",
@@ -150,7 +160,7 @@ stage2 = MathAnswerExtractorStage(
 # ds = processor(ds)
 
 
-# Now let's create math_equal stage
+##### Creating the third stage definition #####
 
 class MathEqualUDF(StatefulStageUDF):
     def __init__(self, data_column: str, ground_truth_col: str, pred_col: str):
@@ -180,6 +190,8 @@ stage3 = MathEqualStage(
     ),
 )
 
+
+##### Testing the processor #####
 score_processor = Processor(
     config=ProcessorConfig(batch_size=64),
     stages=[stage1, stage2, stage3],
@@ -188,9 +200,8 @@ score_processor = Processor(
 # ds = score_processor(ds)
 
 
-# Now let's create a processor 
-
-
+##### Creating the processor config #####
+# This is the reusable processor config
 class MathVerifyProcessorConfig(ProcessorConfig):
     
     generated_column: str
@@ -237,7 +248,8 @@ def build_math_verify_processor(config: MathVerifyProcessorConfig, **kwargs):
         **kwargs
     )
     
-
+##### Testing the reusable processor #####
+# Assuming we have bunch of these processors we can just import them and chain them together 
 processor = build_math_verify_processor(
     MathVerifyProcessorConfig(
         batch_size=1,
@@ -248,7 +260,5 @@ processor = build_math_verify_processor(
 )
 ds = processor(ds)
 
-
 row = ds.take(1)[0]
-
 pprint.pprint(row)
