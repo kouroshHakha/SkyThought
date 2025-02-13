@@ -51,3 +51,23 @@ class AIME24Env(Env):
                 postprocess=lambda x: {**x, "math_score": x["score"]},
             ),
         ]
+       
+ 
+        
+if __name__ == "__main__":
+    config = AIMEConfig()
+    env = Builder.build(config)
+    
+    env.setup(
+        # model_config=VLLMModelConfig(model=...)
+        model_config=HTTPModelConfig(api_key=...)
+        template=...
+    )
+    
+    ds = env.read_dataset()
+    ds = env.generate(ds)
+    ds = env.score(ds)
+    
+    
+    
+    print(ds)
