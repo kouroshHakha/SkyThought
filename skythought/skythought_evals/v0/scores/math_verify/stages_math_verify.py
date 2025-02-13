@@ -1,5 +1,5 @@
 
-from typing import Any, Dict, AsyncIterator, List
+from typing import Any, Dict, AsyncIterator, List, Type
 from ray.llm._internal.batch.stages.stateful_stage import StatefulStage, StatefulStageUDF
 
 
@@ -48,9 +48,9 @@ class MathVerifyScoreUDF(StatefulStageUDF):
             
 
 class MathVerifyParserStage(StatefulStage):
-    fn: StatefulStageUDF = MathVerifyParserUDF
+    fn: Type[MathVerifyParserUDF] = MathVerifyParserUDF
 
 
 class MathVerifyScoreStage(StatefulStage):
-    fn: StatefulStageUDF = MathVerifyScoreUDF
+    fn: Type[MathVerifyScoreUDF] = MathVerifyScoreUDF
 

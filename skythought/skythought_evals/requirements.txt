@@ -1,5 +1,5 @@
 vllm==0.7.0
-pyext
+# pyext
 word2number
 scipy
 datasets
