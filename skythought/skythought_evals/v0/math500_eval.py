@@ -75,11 +75,11 @@ ds = llm_processor(ds)
 
 ##### Making the reusable stages #####
 ############## Strategy: 
-############## 1. One stage does extraction. configurable on which column to extract and strip or not for reusablity
-############## 2. One stage does equality check. configurable on which columns to check
-############## 3. For MATH500, we need to extract final boxed answer from both `generated_text` and `solution` and then do a math_equal check
-############## 4. This will be a processor with 3 stages. To instances of the first stage with different config and one instance of the third stage
-############## 5. To make a reusable processor, we can make more configurations on whether to extract answer from solution or not, etc.
+# 1. One stage does extraction. configurable on which column to extract and strip or not for reusablity
+# 2. One stage does equality check. configurable on which columns to check
+# 3. For MATH500, we need to extract final boxed answer from both `generated_text` and `solution` and then do a math_equal check
+# 4. This will be a processor with 3 stages. To instances of the first stage with different config and one instance of the third stage
+# 5. To make a reusable processor, we can make more configurations on whether to extract answer from solution or not, etc.
 
 # Let's make the stateful stage udfs and in the end processors
 from ray.llm._internal.batch.stages.base import StatefulStageUDF, StatefulStage
