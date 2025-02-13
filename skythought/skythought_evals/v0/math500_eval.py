@@ -262,3 +262,33 @@ ds = processor(ds)
 
 row = ds.take(1)[0]
 pprint.pprint(row)
+
+
+
+##### Pretending the library is implemnted ##### 
+from .scores.math import MathVerifyProcessorConfig, build_math_verify_processor
+
+llm = EndpointLLM(model="gpt-4o-mini", template=template, http_config={"url": "https://api.openai.com/v1/chat/completions", "headers": {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"}})
+# or llm = VLLM(model=..., template=..., kwargs=...)
+
+def read_dataset():
+    ...
+    
+    
+ds = read_dataset()
+ds = llm(ds)
+
+
+processor = build_math_verify_processor(
+    MathVerifyProcessorConfig(
+        batch_size=1,
+        generated_column="generated_text",
+        answer_column="answer",
+        should_extract_answer=False,
+    )
+)
+
+ds = processor(ds)
+
+row = ds.take(1)[0]
+pprint.pprint(row)
